@@ -24,8 +24,8 @@ if gpus:
 
 # Hpyerparameters
 MINIBATCH_SIZE = 32
-MAX_REPLAY_MEMORY_SIZE = 100_000
-START_TRAINING_AFTER = 10_000
+MAX_REPLAY_MEMORY_SIZE = 10_000
+START_TRAINING_AFTER = 1_000
 FRAMES_TO_INCLUDE = 4
 UPDATE_TARGET_EVERY = 10_000
 DISCOUNT = 0.99
@@ -221,6 +221,7 @@ if __name__ == "__main__":
     agent.save_params()
     for e in range(20000):
         agent.run_ep(e, save_metrics=True)
+        print(f'loss: {agent.model_loss.result()}, accuracy: {agent.model_accuracy.result()}')
         if e % 100 == 0:
             agent.save_params()
             print(f'loss: {agent.model_loss.result()}, accuracy: {agent.model_accuracy.result()}\n'

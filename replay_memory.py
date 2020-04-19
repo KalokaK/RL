@@ -18,10 +18,10 @@ class Storage(object):
         self.max_len = max_len
         self.state_shape = state_shape
         self.minibatch_size = minibatch_size
-        self.frame_storage = deque(np.empty((max_len, *state_shape), dtype='uint8'), max_len)
-        self.action_storage = deque(np.empty(max_len, dtype='uint8'), max_len)
-        self.reward_storage = deque(np.empty(max_len, dtype='float32'), max_len)
-        self.terminal_storage = deque(np.empty(max_len, dtype=bool), max_len)
+        self.frame_storage = deque(maxlen=max_len)
+        self.action_storage = deque(maxlen=max_len)
+        self.reward_storage = deque(maxlen=max_len)
+        self.terminal_storage = deque(maxlen=max_len)
 
         self.s0 = np.empty((32, *self.state_shape), dtype='float32')
         self.a = np.empty(32, dtype='uint8')
@@ -51,7 +51,7 @@ class Storage(object):
         returns arrays of matching before-states (s0), actions (a), rewards (r),
         after-states(s1), and terminals (t)
         """
-        idxs = np.random.randint(0, self.max_len - 2, self.minibatch_size)
+        idxs = np.random.randint(0, len(self.terminal_storage) - 2, self.minibatch_size)
 
         for i in range(self.minibatch_size):
             idx = idxs[i]
