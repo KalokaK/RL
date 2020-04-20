@@ -1,9 +1,7 @@
-from random import sample
+
 from functools import wraps
 from time import time
 import numpy as np
-import tensorflow as tf
-from _collections import deque
 
 # courtesy of https://stackoverflow.com/questions/51503672/decorator-for-timeit-timeit-method/51503837#51503837
 
@@ -63,4 +61,3 @@ class ObservationBuffer:
         assert self.buffer[:, :, 0].shape == observation.shape, 'invalid observation shape'
 
         self.buffer = np.stack([observation]*self.frames, axis=-1)
-
