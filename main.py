@@ -1,11 +1,11 @@
 import tensorflow as tf
 import tensorflow.keras as K
+from tensorflow.keras.layers import Dense, Flatten, Conv2D, Add, Lambda, Input
 import numpy as np
 import pickle
 import matplotlib.pyplot as plt
-from tensorflow.keras.layers import Dense, Flatten, Conv2D, MaxPool2D, Add, Lambda, Input
 import os, datetime, time
-import helpers
+import models
 from cusotm_atari_preprocessing import AtariPreprocessing
 import gym.envs.atari.atari_env
 from replay_memory import Storage
@@ -35,19 +35,23 @@ TWEAK HYPER PARAMS              | |         # at this point this is the most obv
 
 """
 
+print(', executing_eagerly in print: {}'.format(tf.executing_eagerly()))
+tf.print(', executing_eagerly in tf.print: {}'.format(tf.executing_eagerly()))
+
 # Agent parameters
-EXPLORATION_RATE = 1.0
+EXPLORATION_RATE = 0.1
 MIN_EXPLORATION_RATE = 0.1
-FRAMES_TO_REACH_FINAL = 1_000_000
+FRAMES_TO_REACH_FINAL = 500_000
 MINIBATCH_SIZE = 32
-MAX_REPLAY_MEMORY_SIZE = 500_000
-START_TRAINING_AFTER = 50_000
+MAX_REPLAY_MEMORY_SIZE = 200_00
+START_TRAINING_AFTER = 10_000
 FRAMES_TO_INCLUDE = 4
-UPDATE_TARGET_EVERY = 33_000
+UPDATE_TARGET_EVERY = 10_000
 DISCOUNT = 0.99
 ACTION_REPEAT = 4  # ie. agent sees every n th frame
 OPTIMIZER_STEP_EVERY = 4  # optimizer is applied every n th action choice
 DUELING = True
+DOUBLE = True
 
 # Optimizer parameters
 LEARN_RATE = 0.00015
@@ -79,7 +83,7 @@ class Agent:
 
         self.exploration_slope = (MIN_EXPLORATION_RATE - EXPLORATION_RATE) / FRAMES_TO_REACH_FINAL
         self.exploration_decay = False
-        self.exploration_rate = 1.0
+        self.exploration_rate = EXPLORATION_RATE
         self.min_exploration_rate = MIN_EXPLORATION_RATE
         self.exploration_frames_to_final = FRAMES_TO_REACH_FINAL
 
@@ -88,18 +92,21 @@ class Agent:
         self.action_shape = self.env.action_space.n
 
         # models and other objects
-        self.step_model = self.get_model(dueling=DUELING)
-        self.target_model = self.get_model(dueling=DUELING)
+        self.step_model = self.get_model(DUELING)
+        self.target_model = self.get_model(DUELING)
         self.update_target_model()
+
         self.replay_memory = Storage(self.max_replay, self.state_shape, self.minibatch_size)
         self.ckpt = tf.train.Checkpoint(model=self.step_model)
         self.ckpt_manager = tf.train.CheckpointManager(self.ckpt, './checkpoint', max_to_keep=10)
 
         # metrics
         self.model_loss = tf.keras.metrics.Mean('model_loss', dtype=tf.float32)
-        current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        model_log_dir = 'logs/gradient_tape/' + current_time
-        self.model_summary_writer = tf.summary.create_file_writer(model_log_dir)
+        current_time = datetime.datetime.now().strftime("%Y-%m-%d__%H-%M-%S")
+        self.graph_log_dir = f'logs/graph/{current_time}/'
+        self.stats_log_dir = f'logs/stats/{current_time}/'
+        self.graph_summary_writer = tf.summary.create_file_writer(self.graph_log_dir)
+        self.stats_summary_writer = tf.summary.create_file_writer(self.stats_log_dir)
 
         self.total_steps = 0
         self.total_eps = 0
@@ -112,7 +119,9 @@ class Agent:
         self.target_model.summary()
 
         if load_from_file:
-            with open('agent_state.state', 'rb') as f:
+            if DOUBLE or DUELING: names = ('agent_state.state', 'step_model.h5', 'target_model.h5')
+            else: names = ('agent_state_simple.state', 'step_model_simple.h5', 'target_model_simple.h5')
+            with open(names[0], 'rb') as f:
                 params = pickle.load(f)
                 self.exploration_decay = params[0]
                 self.exploration_rate = params[1]
@@ -121,8 +130,11 @@ class Agent:
                 self.total_train_steps = params[4]
                 self.replay_memory = params[5]
 
-            self.step_model.load_weights('step_model.h5')
-            self.target_model.load_weights('target_model.h5')
+            self.step_model.load_weights(names[1])
+            self.target_model.load_weights(names[2])
+
+    def update_target_model(self):
+        self.target_model.set_weights(self.step_model.get_weights())
 
     def get_model(self, dueling=False):
         i = Input(self.state_shape)
@@ -149,9 +161,6 @@ class Agent:
 
         return K.models.Model(inputs=i, outputs=x)
 
-    def update_target_model(self):
-        self.target_model.set_weights(self.step_model.get_weights())
-
     def get_action(self, observation, explore=True):
         """
         get an action following an epsilon-greedy policy where an action is selected randomly with a probability of
@@ -176,6 +185,7 @@ class Agent:
 
         else:  # greedy action
             a = self.model_qs_argmax(observation)
+
             return a.numpy()[0]
 
     @tf.function
@@ -184,9 +194,8 @@ class Agent:
         model_out = self.step_model(tf.expand_dims(observation, axis=0))  # get q values
         return tf.argmax(model_out, axis=-1) # return the action with the highest q value
 
-
     @tf.function
-    def train_step(self, batch):
+    def train_step(self, batch, scaling=True, double=False):
         """
         Train the Step model on a batch of (state, action, reward, next_state, terminal[aka done]) transitions
         :param
@@ -196,24 +205,30 @@ class Agent:
         None
         """
         s0, a, r, s1, d = batch
-        s0, s1 = s0 / 255, s1 / 255  # scale the pixel values
-        r = tf.expand_dims(r, -1)  # has to be expanded for broadcasting (batch_size,) -> (batch_size, 1)
-        a = tf.one_hot(a, self.action_shape, axis=-1)  # one hot encoding (batch_size) -> (batch_size, action_space)
+        if scaling:  # WE LOVE AUTO GRAPH.... and its support for native python statements
+            s0, s1 = s0 / 255, s1 / 255  # scale the pixel values
+        a = tf.cast(a, dtype='int32')
 
         # creates a mask where 'done' is encoded as 0 and 'not done' is encoded as 1. this can then be multiplied
         # with the 'future reward term in the bellman equation ( y*(Q_target(s', a'=argmax(Q_step(s', a')) )
         # to mask off frames where the concept of a future reward is illogical nonsensical
-        done_mask = tf.expand_dims(tf.cast(tf.math.logical_not(d), dtype='float32'), 1)
+        done_mask = tf.cast(tf.math.logical_not(d), dtype='float32')
 
-        # Q_step*(s,a)   <--   r + y*(Q_target(s', a'=argmax(Q_step(s', a')) DOUBLE DQN BELLMAN
-        pred_s1 = self.target_model(s1)  # Q_target(s', a') for all a'
-        idxs = tf.expand_dims(tf.argmax(self.step_model(s1), axis=-1), axis=-1)  # a'=argmax(Q_step(s', a')
-        s1_qs = tf.expand_dims(tf.gather_nd(pred_s1, idxs, batch_dims=1), -1)  # Q_target(s', a'=argmax(Q_step(s', a')
-        act_ys = a * (r + done_mask * (self.discount * s1_qs))  # r + y*(Q_target(s', a'=argmax(Q_step(s', a'))
+        if double:
+            # Q_step*(s,a)   <--   r + y * (Q_target(s', a'=argmax(Q_step(s', a')) DOUBLE BELLMAN
+            pred_s1 = self.target_model(s1)  # Q_target(s', a') for all a'
+            idxs = tf.expand_dims(tf.argmax(self.step_model(s1), axis=-1), axis=-1)  # a'=argmax(Q_step(s', a')
+            s1_qs = tf.gather_nd(pred_s1, idxs, batch_dims=1)  # Q_target(s', a'=argmax(Q_step(s', a')
+            act_ys = r + done_mask * (self.discount * s1_qs)  # r + y*(Q_target(s', a'=argmax(Q_step(s', a'))
+
+        else:
+            # Q_step*(s,a)   <--   r + y * max_a'(Q_target(s', a')) BELLMAN
+            s1_qs = tf.reduce_max(self.target_model(s1), axis=-1)  # max_a'(Q_target(s', a'))
+            act_ys = r + done_mask * (self.discount * s1_qs)  # r + y * max_a'(Q_target(s', a'))
 
         # gradient descent step, same as supervised learning
         with tf.GradientTape() as tape:
-            pre_ys = self.step_model(s0)
+            pre_ys = tf.gather_nd(self.step_model(s0), tf.expand_dims(a, -1), batch_dims=1)
             loss = K.losses.mean_squared_error(act_ys, pre_ys)
 
         gradients = tape.gradient(loss, self.step_model.trainable_variables)
@@ -236,11 +251,19 @@ class Agent:
                 self.total_train_steps,
                 self.replay_memory,
             )
-            with open('agent_state.state', 'w+b') as f:
-                pickle.dump(params, f)
+            if DUELING or DOUBLE:
+                with open('agent_state.state', 'w+b') as f:
+                    pickle.dump(params, f)
+            else:
+                with open('agent_state_simple.state', 'w+b') as f:
+                    pickle.dump(params, f)
 
-        self.step_model.save_weights('step_model.h5')
-        self.target_model.save_weights('target_model.h5')
+        if DUELING or DOUBLE:
+            self.step_model.save_weights('step_model_simple.h5')
+            self.target_model.save_weights('target_model_simple.h5')
+        else:
+            self.step_model.save_weights('step_model_simple.h5')
+            self.target_model.save_weights('target_model_simple.h5')
 
     # TODO implement reset method for agent
     # TODO implement save agent params and state
@@ -257,6 +280,7 @@ class Agent:
             # t0 = time.time()
             action = self.get_action(state)  # get action
             state, reward, done, info = self.env.step(action)  # make step with chosen action
+            env.render()
 
             # t1 = time.time()
             self.replay_memory.push((state, action, reward, done))  # update replay memory
@@ -265,7 +289,8 @@ class Agent:
 
             # start training after minimum experiences in memory
             if self.total_steps >= self.train_start and self.total_steps % self.optimizer_frequency == 0:
-                self.train_step(self.replay_memory.minibatch())
+                self.train_step(self.replay_memory.minibatch(), double=DOUBLE)
+
             # t3 = time.time()
             # update target every n steps
             if self.total_steps % self.target_update == 0:
@@ -288,7 +313,7 @@ class Agent:
         # saving metrics
         if save_metrics:
             assert ep_idx is not None, 'no episode indexing given while summary is enabled'
-            with self.model_summary_writer.as_default():
+            with self.stats_summary_writer.as_default():
                 tf.summary.scalar('loss', self.model_loss.result(), self.total_eps)
                 tf.summary.scalar('ep_reward', ep_reward, self.total_eps)
                 tf.summary.scalar('ep_steps', step, self.total_eps)
@@ -304,11 +329,11 @@ class Agent:
 
 if __name__ == "__main__":
     agent = Agent(load_from_file=False)
-    agent.save_params(model_only=True)
+    agent.save_params(model_only=False)
     for e in range(20000):
         agent.run_ep(e, save_metrics=True)
         if e % 10 == 0:
-            agent.save_params(model_only=True)
+            agent.save_params(model_only=False)
             print(f'loss moving avg past 10: {np.mean(agent.ep_losses[-10:])} '
                   f'ep_reward moving avg past 10: {np.mean(agent.ep_rewards[-10:])} \n'
                   f'current exploration rate: {agent.exploration_rate}')
