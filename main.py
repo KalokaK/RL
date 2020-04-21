@@ -6,13 +6,12 @@ import matplotlib.pyplot as plt
 from tensorflow.keras.layers import Dense, Flatten, Conv2D, MaxPool2D, Add, Lambda, Input
 import os, datetime, time
 import helpers
-from gym.wrappers.cusotm_atari_preprocessing import AtariPreprocessing
+from cusotm_atari_preprocessing import AtariPreprocessing
 import gym.envs.atari.atari_env
 from replay_memory import Storage
 from helpers import measure
 
-plt.ion()
-
+# utility stuff
 GPU = True
 if not GPU: os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 
@@ -24,25 +23,45 @@ if gpus:
   except RuntimeError as e:
     print(e)
 
-# Hpyerparameters
-MINIBATCH_SIZE = 32
-MAX_REPLAY_MEMORY_SIZE = 50_000
-START_TRAINING_AFTER = 10_000
-FRAMES_TO_INCLUDE = 4
-UPDATE_TARGET_EVERY = 10_000
-DISCOUNT = 0.99
-ACTION_REPEAT = 4  # ie. agent sees every n th frame
-OPTIMIZER_STEP_EVERY = 4  # optimizer is applied every n th action choice
-LEARN_RATE = 0.00025
+"""
+TODO DEBUG CHECKLIST
+# Game State output             |x|         # other outputs not thoroughly tested but looking at them they look right
+# Replay Buffer                 |x|         # all methods work as intended and are even acceptably fast
+# Actual Network                | |         # to be honest i don't know what could be wrong thee will still try
+# step / episode loop           | |         # 
+# train_step method             | |         #
+# get_action method             | |         #
+TWEAK HYPER PARAMS              | |         # at this point this is the most obv one and I dread it
+
+"""
+
+# Agent parameters
 EXPLORATION_RATE = 1.0
 MIN_EXPLORATION_RATE = 0.1
 FRAMES_TO_REACH_FINAL = 1_000_000
+MINIBATCH_SIZE = 32
+MAX_REPLAY_MEMORY_SIZE = 500_000
+START_TRAINING_AFTER = 50_000
+FRAMES_TO_INCLUDE = 4
+UPDATE_TARGET_EVERY = 33_000
+DISCOUNT = 0.99
+ACTION_REPEAT = 4  # ie. agent sees every n th frame
+OPTIMIZER_STEP_EVERY = 4  # optimizer is applied every n th action choice
+DUELING = True
+
+# Optimizer parameters
+LEARN_RATE = 0.00015
+BETA_1 = 0.95
+BETA_2 = 0.95
+EPSILON = 0.01
+
+# Environment parameters
 MAX_NO_ACTION = 30
 GAME = 'boxing'
 
 # utility objects
 env = gym.envs.atari.atari_env.AtariEnv(game=GAME, obs_type='image', frameskip=1)
-optimizer = K.optimizers.Adam(LEARN_RATE, beta_1=0.95, beta_2=0.95, epsilon=0.01)
+optimizer = K.optimizers.Adam(LEARN_RATE, beta_1=BETA_1, beta_2=BETA_2, epsilon=EPSILON)
 
 
 class Agent:
@@ -69,8 +88,8 @@ class Agent:
         self.action_shape = self.env.action_space.n
 
         # models and other objects
-        self.step_model = self.get_model()
-        self.target_model = self.get_model()
+        self.step_model = self.get_model(dueling=DUELING)
+        self.target_model = self.get_model(dueling=DUELING)
         self.update_target_model()
         self.replay_memory = Storage(self.max_replay, self.state_shape, self.minibatch_size)
         self.ckpt = tf.train.Checkpoint(model=self.step_model)
@@ -105,59 +124,94 @@ class Agent:
             self.step_model.load_weights('step_model.h5')
             self.target_model.load_weights('target_model.h5')
 
-    def get_model(self):
+    def get_model(self, dueling=False):
         i = Input(self.state_shape)
         x = Conv2D(32, 8, (4, 4), activation='relu')(i)
         x = Conv2D(64, 4, (2, 2), activation='relu')(x)
         x = Conv2D(64, 3, (1, 1), activation='relu')(x)
         x = Flatten()(x)
 
-        a = Dense(512, activation='relu')(x)
-        a = Dense(self.action_shape)(a)
-        a = Lambda(lambda a: a[:, :] - tf.reduce_mean(a[:, :], axis=-1, keepdims=True),
-                   output_shape=(self.action_shape,))(a)
+        if dueling:
+            a = Dense(512, activation='relu')(x)
+            a = Dense(self.action_shape)(a)
+            a = Lambda(lambda a: a[:, :] - tf.reduce_mean(a[:, :], axis=-1, keepdims=True),
+                       output_shape=(self.action_shape,))(a)
 
-        v = Dense(512, activation='relu')(x)
-        v = Dense(1)(v)
-        v = Lambda(lambda s: tf.expand_dims(s[:, 0], -1),
-                   output_shape=(self.action_shape,))(v)
+            v = Dense(512, activation='relu')(x)
+            v = Dense(1)(v)
+            v = Lambda(lambda s: tf.expand_dims(s[:, 0], -1),
+                       output_shape=(self.action_shape,))(v)
 
-        x = Add()([v, a])
+            x = Add()([v, a])
+        else:
+            x = Dense(512, activation='relu')(x)
+            x = Dense(self.action_shape)(x)
 
         return K.models.Model(inputs=i, outputs=x)
 
     def update_target_model(self):
         self.target_model.set_weights(self.step_model.get_weights())
 
-    def get_action(self, observation):
+    def get_action(self, observation, explore=True):
+        """
+        get an action following an epsilon-greedy policy where an action is selected randomly with a probability of
+        epsilon, else the action with the highest q value is selected from the model with current policy applied to
+        the current observation.
+        :param observation: the observation upon which the greedy action is based should it be take.
+        array with shape = (*observation_space, remember_frames) is expected
+        :param explore: if explore is True the agent will follow a greedy policy
+        :return: None
+        """
         a = 0
-        if self.exploration_decay or self.total_steps <= self.train_start:
-            if self.exploration_rate >= np.random.random():
-                a = self.env.action_space.sample()
-        elif self.min_exploration_rate >= np.random.random():
-            a = self.env.action_space.sample()
 
-        else:
-            observation = tf.math.divide(observation, 255)
-            model_out = self.step_model(tf.expand_dims(observation, axis=0))
-            a = tf.argmax(model_out, axis=-1).numpy()[0]
+        if explore:
+            if self.total_steps < self.train_start:  # to partially fill replay buffer with random experiences
+                return self.env.action_space.sample()
 
-        return a
+            elif np.random.random() <= self.exploration_rate:  # explore the env with a probability of epsilon
+                return self.env.action_space.sample()
+
+            else:  # else take greedy action
+                return self.get_action(observation, explore=False)
+
+        else:  # greedy action
+            a = self.model_qs_argmax(observation)
+            return a.numpy()[0]
+
+    @tf.function
+    def model_qs_argmax(self, observation):
+        observation = tf.math.divide(observation, 255)  # scale pixel values
+        model_out = self.step_model(tf.expand_dims(observation, axis=0))  # get q values
+        return tf.argmax(model_out, axis=-1) # return the action with the highest q value
+
 
     @tf.function
     def train_step(self, batch):
+        """
+        Train the Step model on a batch of (state, action, reward, next_state, terminal[aka done]) transitions
+        :param
+        batch: the batch of transition to train on must be in the format:
+        [state_array, action_array, reward_array, next_step_array, terminal_array]
+        :return:
+        None
+        """
         s0, a, r, s1, d = batch
         s0, s1 = s0 / 255, s1 / 255  # scale the pixel values
-        r = tf.expand_dims(r, -1)
-        a = tf.one_hot(a, self.action_shape, axis=-1)
+        r = tf.expand_dims(r, -1)  # has to be expanded for broadcasting (batch_size,) -> (batch_size, 1)
+        a = tf.one_hot(a, self.action_shape, axis=-1)  # one hot encoding (batch_size) -> (batch_size, action_space)
+
+        # creates a mask where 'done' is encoded as 0 and 'not done' is encoded as 1. this can then be multiplied
+        # with the 'future reward term in the bellman equation ( y*(Q_target(s', a'=argmax(Q_step(s', a')) )
+        # to mask off frames where the concept of a future reward is illogical nonsensical
         done_mask = tf.expand_dims(tf.cast(tf.math.logical_not(d), dtype='float32'), 1)
 
-        # Q_step*(s,a)   <--   r + y*(Q_step(s', a'=argmax(Q_target(s', a')) DOUBLE DQN BELLMAN
-        pred_s1 = self.step_model(s1)  # Q_step(s', a') for all a'
-        idxs = tf.expand_dims(tf.argmax(self.target_model(s1), axis=-1), axis=-1)  # a'=argmax(Q_target(s', a')
-        s1_qs = tf.expand_dims(tf.gather_nd(pred_s1, idxs, batch_dims=1), -1)  # Q_step(s', a'=argmax(Q_target(s', a')
-        act_ys = a * (r + done_mask * (self.discount * s1_qs))  # r + y*(Q_step(s', a'=argmax(Q_target(s', a'))
+        # Q_step*(s,a)   <--   r + y*(Q_target(s', a'=argmax(Q_step(s', a')) DOUBLE DQN BELLMAN
+        pred_s1 = self.target_model(s1)  # Q_target(s', a') for all a'
+        idxs = tf.expand_dims(tf.argmax(self.step_model(s1), axis=-1), axis=-1)  # a'=argmax(Q_step(s', a')
+        s1_qs = tf.expand_dims(tf.gather_nd(pred_s1, idxs, batch_dims=1), -1)  # Q_target(s', a'=argmax(Q_step(s', a')
+        act_ys = a * (r + done_mask * (self.discount * s1_qs))  # r + y*(Q_target(s', a'=argmax(Q_step(s', a'))
 
+        # gradient descent step, same as supervised learning
         with tf.GradientTape() as tape:
             pre_ys = self.step_model(s0)
             loss = K.losses.mean_squared_error(act_ys, pre_ys)
@@ -167,17 +221,23 @@ class Agent:
 
         self.model_loss(loss)
 
-    def save_params(self):
-        params = (
-            self.exploration_decay,
-            self.exploration_rate,
-            self.total_steps,
-            self.total_eps,
-            self.total_train_steps,
-            self.replay_memory,
-        )
-        with open('agent_state.state', 'w+b') as f:
-            pickle.dump(params, f)
+
+    def save_params(self, model_only=False):
+        """
+        save model parameters required to continue the training process
+        :return: None
+        """
+        if not model_only:
+            params = (
+                self.exploration_decay,
+                self.exploration_rate,
+                self.total_steps,
+                self.total_eps,
+                self.total_train_steps,
+                self.replay_memory,
+            )
+            with open('agent_state.state', 'w+b') as f:
+                pickle.dump(params, f)
 
         self.step_model.save_weights('step_model.h5')
         self.target_model.save_weights('target_model.h5')
@@ -192,7 +252,7 @@ class Agent:
         step = 0
         ep_reward = 0
         state = self.env.reset()
-        plt.imsave('img.png', state[:, :, 0])
+
         while not done and step < 100_000:
             # t0 = time.time()
             action = self.get_action(state)  # get action
@@ -244,11 +304,11 @@ class Agent:
 
 if __name__ == "__main__":
     agent = Agent(load_from_file=False)
-    agent.save_params()
+    agent.save_params(model_only=True)
     for e in range(20000):
         agent.run_ep(e, save_metrics=True)
         if e % 10 == 0:
-            agent.save_params()
+            agent.save_params(model_only=True)
             print(f'loss moving avg past 10: {np.mean(agent.ep_losses[-10:])} '
                   f'ep_reward moving avg past 10: {np.mean(agent.ep_rewards[-10:])} \n'
                   f'current exploration rate: {agent.exploration_rate}')

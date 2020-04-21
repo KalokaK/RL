@@ -38,7 +38,7 @@ class Storage(object):
         :return:
         None
         """
-        self.frame_storage.appendleft(experience[0])
+        self.frame_storage.appendleft(np.copy(experience[0]))
         self.action_storage.appendleft(experience[1])
         self.reward_storage.appendleft(experience[2])
         self.terminal_storage.appendleft(experience[3])
@@ -55,7 +55,7 @@ class Storage(object):
 
         for i in range(self.minibatch_size):
             idx = idxs[i]
-            if self.terminal_storage[idx]:
+            if self.terminal_storage[idx+1]:
                 idx += 1
 
             self.s0[i] = self.frame_storage[idx + 1]
@@ -65,5 +65,7 @@ class Storage(object):
             self.t[i] = self.terminal_storage[idx]
 
         return self.s0, self.a, self.r, self.s1, self.t
+
+
 
 
