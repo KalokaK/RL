@@ -82,12 +82,12 @@ class AtariPreprocessing(gym.Wrapper):
             if grayscale_obs:
                 self.frame_stack = np.zeros((screen_size, screen_size, frame_skip), dtype='float32')
             else:
-                pass # TODO implement rgb for this
+                pass  # TODO implement rgb for this
         else:
             if grayscale_obs:
                 self.frame_stack = np.zeros((screen_size, screen_size, frame_skip), dtype='uint8')
             else:
-                pass # TODO implement rgb for this
+                pass  # TODO implement rgb for this
 
     def step(self, action):
         R = 0.0

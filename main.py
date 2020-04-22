@@ -39,13 +39,13 @@ print(', executing_eagerly in print: {}'.format(tf.executing_eagerly()))
 tf.print(', executing_eagerly in tf.print: {}'.format(tf.executing_eagerly()))
 
 # Agent parameters
-EXPLORATION_RATE = 0.1
+EXPLORATION_RATE = 1.0
 MIN_EXPLORATION_RATE = 0.1
 FRAMES_TO_REACH_FINAL = 1_000_000
-EXPONENTIAL_EXPLORATION_DECAY =
+EXPONENTIAL_EXPLORATION_DECAY = True  # default is linear
 MINIBATCH_SIZE = 32
 MAX_REPLAY_MEMORY_SIZE = 200_00
-START_TRAINING_AFTER = 10_000
+START_TRAINING_AFTER = 20_000
 FRAMES_TO_INCLUDE = 4
 UPDATE_TARGET_EVERY = 10_000
 DISCOUNT = 0.99
@@ -62,7 +62,7 @@ EPSILON = 0.01
 
 # Environment parameters
 MAX_NO_ACTION = 30
-GAME = 'boxing'
+GAME = 'breakout'
 
 # utility objects
 env = gym.envs.atari.atari_env.AtariEnv(game=GAME, obs_type='image', frameskip=1)
@@ -82,7 +82,11 @@ class Agent:
         self.optimizer_frequency = OPTIMIZER_STEP_EVERY
         self.learn_rate = LEARN_RATE
 
-        self.exploration_slope = (MIN_EXPLORATION_RATE - EXPLORATION_RATE) / FRAMES_TO_REACH_FINAL
+        if EXPONENTIAL_EXPLORATION_DECAY:
+            self.exploration_factor = MIN_EXPLORATION_RATE ** (1 / FRAMES_TO_REACH_FINAL)
+        else:
+            self.exploration_slope = (MIN_EXPLORATION_RATE - EXPLORATION_RATE) / FRAMES_TO_REACH_FINAL
+
         self.exploration_decay = False
         self.exploration_rate = EXPLORATION_RATE
         self.min_exploration_rate = MIN_EXPLORATION_RATE
@@ -120,8 +124,8 @@ class Agent:
         self.target_model.summary()
 
         if load_from_file:
-            if DOUBLE or DUELING: names = ('agent_state.state', 'step_model.h5', 'target_model.h5')
-            else: names = ('agent_state_simple.state', 'step_model_simple.h5', 'target_model_simple.h5')
+            if DOUBLE or DUELING: names = (f'agent_state_{GAME}.state', f'step_model_{GAME}.h5', f'target_model_{GAME}.h5')
+            else: names = (f'agent_state_simple_{GAME}.state', f'step_model_simple_{GAME}.h5', f'target_model_simple_{GAME}.h5')
             with open(names[0], 'rb') as f:
                 params = pickle.load(f)
                 self.exploration_decay = params[0]
@@ -253,18 +257,18 @@ class Agent:
                 self.replay_memory,
             )
             if DUELING or DOUBLE:
-                with open('agent_state.state', 'w+b') as f:
+                with open(f'agent_state_{GAME}.state', 'w+b') as f:
                     pickle.dump(params, f)
             else:
-                with open('agent_state_simple.state', 'w+b') as f:
+                with open(f'agent_state_simple_{GAME}.state', 'w+b') as f:
                     pickle.dump(params, f)
 
         if DUELING or DOUBLE:
-            self.step_model.save_weights('step_model_simple.h5')
-            self.target_model.save_weights('target_model_simple.h5')
+            self.step_model.save_weights(f'step_model_simple_{GAME}.h5')
+            self.target_model.save_weights(f'target_model_simple_{GAME}.h5')
         else:
-            self.step_model.save_weights('step_model_simple.h5')
-            self.target_model.save_weights('target_model_simple.h5')
+            self.step_model.save_weights(f'step_model_simple_{GAME}.h5')
+            self.target_model.save_weights(f'target_model_simple_{GAME}.h5')
 
     # TODO implement reset method for agent
     # TODO implement save agent params and state
@@ -281,7 +285,6 @@ class Agent:
             # t0 = time.time()
             action = self.get_action(state)  # get action
             state, reward, done, info = self.env.step(action)  # make step with chosen action
-            env.render()
 
             # t1 = time.time()
             self.replay_memory.push((state, action, reward, done))  # update replay memory
@@ -296,15 +299,22 @@ class Agent:
             # update target every n steps
             if self.total_steps % self.target_update == 0:
                 self.update_target_model()
+
             # the exploration rate will not decay until start of training
             if self.total_steps == self.train_start:
                 self.exploration_decay = True
+
             # manage the decay of the exploration rate
             if self.exploration_decay:
-                self.exploration_rate += self.exploration_slope
+                if EXPONENTIAL_EXPLORATION_DECAY:
+                    self.exploration_rate *= self.exploration_factor
+                else:
+                    self.exploration_rate += self.exploration_slope
+
                 # turn off exploration rate after n steps
                 if self.total_steps - self.train_start >= self.exploration_frames_to_final:
                     self.exploration_decay = False
+
             # print(time.time()-t0, t1-t0, t2-t1, t3-t2)
 
             # update counters
@@ -330,15 +340,22 @@ class Agent:
 
 if __name__ == "__main__":
     agent = Agent(load_from_file=False)
-    agent.save_params(model_only=False)
-    for e in range(20000):
+    agent.save_params(model_only=True)
+    agent.step_model.save(f'full_models/step_model_{GAME}.h5')
+    agent.step_model.save(f'full_models/target_model_{GAME}.h5')
+    e = 0
+    while agent.total_steps <= 100_000_000:
         agent.run_ep(e, save_metrics=True)
-        if e % 10 == 0:
-            agent.save_params(model_only=False)
+        if e % 100 == 0:
+            agent.save_params(model_only=True)
             print(f'loss moving avg past 10: {np.mean(agent.ep_losses[-10:])} '
                   f'ep_reward moving avg past 10: {np.mean(agent.ep_rewards[-10:])} \n'
                   f'current exploration rate: {agent.exploration_rate}')
 
-        if e % 50 == 0:
+        if e % 500 == 0:
             agent.ckpt_manager.save()
+            agent.step_model.save(f'full_models/step_model_{GAME}.h5')
+            agent.step_model.save(f'full_models/target_model_{GAME}.h5')
+
+        e += 1
 
